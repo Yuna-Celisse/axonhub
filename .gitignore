@@ -162,6 +162,7 @@ config.schema.json
 *.db-shm
 *.db-wal
 *.agent/summary
+.agent/windows-service/
 .factory
 .omo/
 .omc/
