@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -12,13 +14,16 @@ import (
 	entprivacy "github.com/looplj/axonhub/internal/ent/privacy"
 	"github.com/looplj/axonhub/internal/server/biz"
 	"github.com/looplj/axonhub/internal/server/orchestrator"
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
+	"github.com/looplj/axonhub/llm/streams"
 	"github.com/looplj/axonhub/llm/transformer/anthropic"
 )
 
 type AnthropicHandlersParams struct {
 	fx.In
 
+	GatewayConfig               AnthropicGatewayConfig
 	ChannelService              *biz.ChannelService
 	ModelService                *biz.ModelService
 	DefaultSelector             *orchestrator.DefaultSelector
@@ -36,13 +41,26 @@ type AnthropicHandlersParams struct {
 }
 
 type AnthropicHandlers struct {
-	ChannelService         *biz.ChannelService
-	ModelService           *biz.ModelService
-	SystemService          *biz.SystemService
-	ChatCompletionHandlers *ChatCompletionHandlers
+	ChannelService            *biz.ChannelService
+	ModelService              *biz.ModelService
+	SystemService             *biz.SystemService
+	GatewayModelAliasExcludes map[string]struct{}
+	ChatCompletionHandlers    *ChatCompletionHandlers
+}
+
+type AnthropicGatewayConfig struct {
+	ModelAliasExcludes []string
 }
 
 func NewAnthropicHandlers(params AnthropicHandlersParams) *AnthropicHandlers {
+	aliasExcludes := make(map[string]struct{}, len(params.GatewayConfig.ModelAliasExcludes))
+	for _, modelID := range params.GatewayConfig.ModelAliasExcludes {
+		modelID = strings.ToLower(strings.TrimSpace(modelID))
+		if modelID != "" {
+			aliasExcludes[modelID] = struct{}{}
+		}
+	}
+
 	return &AnthropicHandlers{
 		ChatCompletionHandlers: &ChatCompletionHandlers{
 			ChatCompletionOrchestrator: orchestrator.NewChatCompletionOrchestrator(
@@ -63,14 +81,53 @@ func NewAnthropicHandlers(params AnthropicHandlersParams) *AnthropicHandlers {
 			sseKeepAlive:       params.SSEKeepAliveConfig,
 			sseHeartbeatFormat: sseHeartbeatAnthropic,
 		},
-		ChannelService: params.ChannelService,
-		ModelService:   params.ModelService,
-		SystemService:  params.SystemService,
+		ChannelService:            params.ChannelService,
+		ModelService:              params.ModelService,
+		SystemService:             params.SystemService,
+		GatewayModelAliasExcludes: aliasExcludes,
 	}
 }
 
 func (handlers *AnthropicHandlers) CreateMessage(c *gin.Context) {
-	handlers.ChatCompletionHandlers.ChatCompletion(c)
+	handlers.ChatCompletionHandlers.WithStreamWriter(WriteAnthropicSSEStream).ChatCompletion(c)
+}
+
+// WriteAnthropicSSEStream preserves Anthropic's error event envelope for
+// failures that arrive after an SSE response has started. Claude Code relies
+// on this shape to recognize prompt-too-long errors and run its compaction
+// recovery path.
+func WriteAnthropicSSEStream(c *gin.Context, stream streams.Stream[*httpclient.StreamEvent]) {
+	WriteSSEStreamWithErrorFormatter(c, stream, FormatAnthropicStreamError)
+}
+
+// FormatAnthropicStreamError formats a late stream failure using Anthropic's
+// standard {"type":"error","error":{...}} envelope.
+func FormatAnthropicStreamError(_ context.Context, err error) any {
+	err = wrapQuotaExhaustedAsResponseError(err)
+
+	errorType := "api_error"
+	message := orchestrator.ExtractErrorMessage(err)
+	requestID := ""
+
+	var responseErr *llm.ResponseError
+	if errors.As(err, &responseErr) {
+		if responseErr.Detail.Type != "" {
+			errorType = responseErr.Detail.Type
+		}
+		if responseErr.Detail.Message != "" {
+			message = responseErr.Detail.Message
+		}
+		requestID = responseErr.Detail.RequestID
+	}
+
+	return anthropic.AnthropicError{
+		Type:      "error",
+		RequestID: requestID,
+		Error: anthropic.ErrorDetail{
+			Type:    errorType,
+			Message: message,
+		},
+	}
 }
 
 type AnthropicModel struct {
@@ -108,15 +165,7 @@ func (handlers *AnthropicHandlers) ListModels(c *gin.Context) {
 		return
 	}
 
-	anthropicModels := make([]AnthropicModel, 0, len(models))
-	for _, model := range models {
-		anthropicModels = append(anthropicModels, AnthropicModel{
-			ID:          model.ID,
-			Type:        "model",
-			DisplayName: model.DisplayName,
-			CreatedAt:   model.CreatedAt,
-		})
-	}
+	anthropicModels := anthropicModelsWithGatewayAliases(models, handlers.GatewayModelAliasExcludes)
 
 	var firstID string
 	if len(anthropicModels) > 0 {
@@ -135,4 +184,31 @@ func (handlers *AnthropicHandlers) ListModels(c *gin.Context) {
 		"first_id": firstID,
 		"last_id":  lastID,
 	})
+}
+
+func anthropicModelsWithGatewayAliases(models []biz.ModelFacade, aliasExcludes map[string]struct{}) []AnthropicModel {
+	result := make([]AnthropicModel, 0, len(models)*2)
+	for _, model := range models {
+		anthropicModel := AnthropicModel{
+			ID:          model.ID,
+			Type:        "model",
+			DisplayName: model.DisplayName,
+			CreatedAt:   model.CreatedAt,
+		}
+		result = append(result, anthropicModel)
+
+		// Claude Code ignores discovered model IDs that do not start with
+		// "claude" or "anthropic", including explicitly configured AxonHub
+		// models. Emit aliases for both configured and channel-derived models.
+		// Models already represented by Claude Code's fixed Opus/Sonnet/Haiku
+		// slots can be excluded explicitly to avoid duplicate picker entries.
+		_, excluded := aliasExcludes[strings.ToLower(strings.TrimSpace(model.ID))]
+		if alias, ok := biz.ClaudeCodeGatewayModelAlias(model.ID); ok && !excluded {
+			aliasModel := anthropicModel
+			aliasModel.ID = alias
+			result = append(result, aliasModel)
+		}
+	}
+
+	return result
 }

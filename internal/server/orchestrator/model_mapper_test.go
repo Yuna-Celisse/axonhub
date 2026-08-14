@@ -8,6 +8,7 @@ import (
 
 	"github.com/looplj/axonhub/internal/ent"
 	"github.com/looplj/axonhub/internal/objects"
+	"github.com/looplj/axonhub/internal/server/biz"
 )
 
 func TestModelMapper_MapModel(t *testing.T) {
@@ -25,6 +26,12 @@ func TestModelMapper_MapModel(t *testing.T) {
 			apiKey:        nil,
 			originalModel: "gpt-4",
 			expectedModel: "gpt-4",
+		},
+		{
+			name:          "Claude Code discovery alias without API key profile",
+			apiKey:        nil,
+			originalModel: func() string { alias, _ := biz.ClaudeCodeGatewayModelAlias("glm-5.2"); return alias }(),
+			expectedModel: "glm-5.2",
 		},
 		{
 			name: "no profiles",

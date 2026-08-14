@@ -112,6 +112,11 @@ func Run(opts ...fx.Option) {
 					Interval: cfg.SSEKeepAlive.Interval,
 				}
 			}),
+			fx.Provide(func(cfg Config) api.AnthropicGatewayConfig {
+				return api.AnthropicGatewayConfig{
+					ModelAliasExcludes: cfg.API.ClaudeGatewayModelAliasExcludes,
+				}
+			}),
 			fx.Invoke(func(cfg log.Config) {
 				log.SetGlobalConfig(cfg)
 				tracing.SetupLogger(log.GetGlobalLogger())

@@ -107,14 +107,16 @@ func NewModelMapper() *ModelMapper {
 // MapModel applies model mapping from API key profiles if an active profile exists
 // Returns the mapped model name or the original model if no mapping is found.
 func (m *ModelMapper) MapModel(ctx context.Context, apiKey *ent.APIKey, originalModel string) string {
+	discoveryModel := biz.ResolveClaudeCodeGatewayModelAlias(originalModel)
+
 	if apiKey == nil || apiKey.Profiles == nil {
-		return originalModel
+		return discoveryModel
 	}
 
 	profiles := apiKey.Profiles
 	if profiles.ActiveProfile == "" {
 		log.Debug(ctx, "No active profile found for API key", log.String("api_key_name", apiKey.Name))
-		return originalModel
+		return discoveryModel
 	}
 
 	activeProfile := apiKey.GetActiveProfile()
@@ -123,11 +125,11 @@ func (m *ModelMapper) MapModel(ctx context.Context, apiKey *ent.APIKey, original
 			log.String("active_profile", profiles.ActiveProfile),
 			log.String("api_key_name", apiKey.Name))
 
-		return originalModel
+		return discoveryModel
 	}
 
 	// Apply model mapping
-	mappedModel := m.applyModelMapping(activeProfile.ModelMappings, originalModel)
+	mappedModel := m.applyModelMapping(activeProfile.ModelMappings, discoveryModel)
 
 	if mappedModel != originalModel {
 		log.Debug(ctx, "Model mapped using API key profile",

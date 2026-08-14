@@ -254,6 +254,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("server.cors.max_age", "30m")
 	v.SetDefault("server.api.auth.allow_no_auth", false)
 	v.SetDefault("server.api.auth.key_prefix", "ah")
+	v.SetDefault("server.api.claude_gateway_model_alias_excludes", []string{})
 
 	// Database defaults
 	v.SetDefault("db.dialect", "sqlite3")

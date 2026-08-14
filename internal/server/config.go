@@ -137,7 +137,8 @@ type CORS struct {
 }
 
 type API struct {
-	Auth APIAuth `conf:"auth" yaml:"auth" json:"auth"`
+	Auth                            APIAuth  `conf:"auth" yaml:"auth" json:"auth"`
+	ClaudeGatewayModelAliasExcludes []string `conf:"claude_gateway_model_alias_excludes" yaml:"claude_gateway_model_alias_excludes" json:"claude_gateway_model_alias_excludes"`
 }
 
 type APIAuth struct {
