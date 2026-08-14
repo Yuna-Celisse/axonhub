@@ -230,7 +230,8 @@ func convertAssistantMessage(msg llm.Message) []Item {
 			EncryptedContent: encryptedContent,
 			Summary:          summary,
 		})
-	} else {
+	}
+	if len(items) == 0 {
 		portableReasoningSummary = shared.FormatPortableReasoningSummary(msg.ReasoningContent)
 	}
 
