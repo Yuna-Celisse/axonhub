@@ -89,6 +89,58 @@ func TestOutboundConvert_GeminiThoughtSignatureBecomesAnthropicRedactedThinking(
 	require.Equal(t, "Hi", *assistantMsg.Content.MultipleContent[1].Text)
 }
 
+func TestOutboundConvert_ForeignReasoningSignatureBecomesPortableSummary(t *testing.T) {
+	tests := []struct {
+		name   string
+		config *Config
+	}{
+		{name: "official Anthropic", config: nil},
+		{name: "DeepSeek Anthropic-compatible", config: &Config{Type: PlatformDeepSeek}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chatReq := &llm.Request{
+				Model: "target-model",
+				Messages: []llm.Message{
+					{
+						Role:               "assistant",
+						ReasoningContent:   lo.ToPtr("Checked the repository and selected the next implementation step."),
+						ReasoningSignature: lo.ToPtr("gAAAA-foreign-openai-signature"),
+						Content: llm.MessageContent{
+							Content: lo.ToPtr("I will continue with the implementation."),
+						},
+					},
+					{Role: "user", Content: llm.MessageContent{Content: lo.ToPtr("Continue")}},
+				},
+			}
+
+			anthropicReq := convertToAnthropicRequestWithConfig(chatReq, tt.config)
+			require.Len(t, anthropicReq.Messages, 2)
+
+			blocks := anthropicReq.Messages[0].Content.MultipleContent
+			summaryIndex := 0
+			if tt.config != nil && tt.config.Type == PlatformDeepSeek {
+				require.Len(t, blocks, 3)
+				require.Equal(t, "thinking", blocks[0].Type)
+				require.Empty(t, lo.FromPtr(blocks[0].Thinking))
+				require.Nil(t, blocks[0].Signature)
+				summaryIndex = 1
+			} else {
+				require.Len(t, blocks, 2)
+			}
+
+			require.Equal(t, "text", blocks[summaryIndex].Type)
+			require.Equal(t,
+				shared.PortableReasoningSummaryPrefix+"Checked the repository and selected the next implementation step.",
+				lo.FromPtr(blocks[summaryIndex].Text),
+			)
+			require.Equal(t, "text", blocks[summaryIndex+1].Type)
+			require.Equal(t, "I will continue with the implementation.", lo.FromPtr(blocks[summaryIndex+1].Text))
+		})
+	}
+}
+
 func TestConvertToChatCompletionResponse_WithRedactedThinking(t *testing.T) {
 	const (
 		redactedData = "EmwKAhgBEgy3va3pzix/LafPsn4aDFIT2Xlxh0L5L8rLVyIwxtE3rAFBa8cr3qpPkNRj2YfWXGmKDxH4mPnZ5sQ7vB9URj2pLmN3kF8/dW5hR7xJ0aP1oLs9yTcMnKVf2wRpEGjH9XZaBt4UvDcPrQ..."

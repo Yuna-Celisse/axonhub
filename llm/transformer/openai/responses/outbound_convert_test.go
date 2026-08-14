@@ -8,7 +8,62 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
+
+func TestConvertAssistantMessage_PreservesPortableReasoningSummary(t *testing.T) {
+	tests := []struct {
+		name      string
+		signature *string
+	}{
+		{name: "foreign signature", signature: lo.ToPtr("EqQ-anthropic-signature")},
+		{name: "signature removed after recovery", signature: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			items := convertAssistantMessage(llm.Message{
+				Role:               "assistant",
+				ReasoningContent:   lo.ToPtr("Inspected the failing path and selected a safe retry."),
+				ReasoningSignature: tt.signature,
+				Content: llm.MessageContent{
+					Content: lo.ToPtr("Continuing now."),
+				},
+			})
+
+			require.Len(t, items, 1)
+			require.Equal(t, "message", items[0].Type)
+			require.NotNil(t, items[0].Content)
+			require.Len(t, items[0].Content.Items, 2)
+			require.Equal(t, "output_text", items[0].Content.Items[0].Type)
+			require.Equal(t,
+				shared.PortableReasoningSummaryPrefix+"Inspected the failing path and selected a safe retry.",
+				lo.FromPtr(items[0].Content.Items[0].Text),
+			)
+			require.Equal(t, "Continuing now.", lo.FromPtr(items[0].Content.Items[1].Text))
+		})
+	}
+}
+
+func TestConvertAssistantMessage_KeepsValidOpenAIEncryptedReasoning(t *testing.T) {
+	items := convertAssistantMessage(llm.Message{
+		Role:               "assistant",
+		ReasoningContent:   lo.ToPtr("Valid OpenAI summary."),
+		ReasoningSignature: lo.ToPtr("gAAAA-valid-openai-signature"),
+		Content: llm.MessageContent{
+			Content: lo.ToPtr("Visible answer"),
+		},
+	})
+
+	require.Len(t, items, 2)
+	require.Equal(t, "reasoning", items[0].Type)
+	require.Equal(t, "gAAAA-valid-openai-signature", lo.FromPtr(items[0].EncryptedContent))
+	require.Len(t, items[0].Summary, 1)
+	require.Equal(t, "Valid OpenAI summary.", items[0].Summary[0].Text)
+	require.Equal(t, "message", items[1].Type)
+	require.Len(t, items[1].Content.Items, 1)
+	require.Equal(t, "Visible answer", lo.FromPtr(items[1].Content.Items[0].Text))
+}
 
 func TestConvertToolMessage(t *testing.T) {
 	tests := []struct {

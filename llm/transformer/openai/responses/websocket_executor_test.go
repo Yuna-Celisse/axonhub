@@ -3,6 +3,7 @@ package responses
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/require"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/auth"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer/shared"
@@ -1261,6 +1263,107 @@ func TestWebSocketExecutorCloseClosesIdleConnections(t *testing.T) {
 	}
 	require.Empty(t, executor.pool)
 	require.False(t, executor.cleanupScheduled)
+}
+
+func TestWebSocketExecutorFallsBackToHTTPOnInitialErrorEvent(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	var webSocketRequests atomic.Int32
+	var httpRequests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if websocket.IsWebSocketUpgrade(r) {
+			webSocketRequests.Add(1)
+			conn, err := upgrader.Upgrade(w, r, nil)
+			require.NoError(t, err)
+			defer conn.Close()
+
+			var payload map[string]any
+			require.NoError(t, conn.ReadJSON(&payload))
+			require.NoError(t, conn.WriteJSON(map[string]any{
+				"type": "error",
+				"error": map[string]any{
+					"type":    "server_error",
+					"message": "websocket transport unavailable",
+				},
+			}))
+			return
+		}
+
+		httpRequests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err := fmt.Fprint(w, "event: response.completed\n"+
+			`data: {"type":"response.completed","response":{"id":"resp_http","object":"response","created_at":1700000000,"model":"gpt-5","status":"completed","output":[]}}`+
+			"\n\n")
+		require.NoError(t, err)
+	}))
+	defer server.Close()
+
+	httpExecutor := httpclient.NewHttpClientWithProxy(&httpclient.ProxyConfig{Type: httpclient.ProxyTypeDisabled})
+	executor := NewWebSocketExecutor(httpExecutor)
+	stream, err := executor.DoStream(webSocketTestContext(), &httpclient.Request{
+		Method: http.MethodPost,
+		URL:    server.URL + "/v1/responses",
+		Auth:   &httpclient.AuthConfig{Type: httpclient.AuthTypeBearer, APIKey: "test-key"},
+		Body:   []byte(`{"model":"gpt-5","stream":true}`),
+	})
+	require.NoError(t, err)
+	defer stream.Close()
+
+	require.True(t, stream.Next())
+	require.Equal(t, "response.completed", stream.Current().Type)
+	require.False(t, stream.Next())
+	require.NoError(t, stream.Err())
+	require.Equal(t, int32(1), webSocketRequests.Load())
+	require.Equal(t, int32(1), httpRequests.Load())
+}
+
+func TestTopLevelWebSocketErrorParsesAlternatePayloadShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+		want string
+	}{
+		{
+			name: "nested detail",
+			data: `{"type":"error","error":{"type":"server_error","detail":"temporarily unavailable"}}`,
+			want: "websocket error event: server_error: temporarily unavailable",
+		},
+		{
+			name: "string error",
+			data: `{"type":"error","error":"account access denied"}`,
+			want: "websocket error event: account access denied",
+		},
+		{
+			name: "unrecognized",
+			data: `{"type":"error","request_id":"req_123"}`,
+			want: "websocket error event: upstream returned an unrecognized error payload",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := TopLevelWebSocketError([]*httpclient.StreamEvent{{
+				Type: string(StreamEventTypeError),
+				Data: []byte(tt.data),
+			}})
+			require.EqualError(t, err, tt.want)
+		})
+	}
+}
+
+func TestTopLevelWebSocketContextLengthErrorIsBadRequest(t *testing.T) {
+	err := TopLevelWebSocketError([]*httpclient.StreamEvent{{
+		Type: string(StreamEventTypeError),
+		Data: []byte(`{"type":"error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}`),
+	}})
+	require.Error(t, err)
+
+	var responseErr *llm.ResponseError
+	require.True(t, errors.As(err, &responseErr))
+	require.Equal(t, http.StatusBadRequest, responseErr.StatusCode)
+	require.Equal(t, "context_length_exceeded", responseErr.Detail.Code)
+	require.Equal(t, "invalid_request_error", responseErr.Detail.Type)
+	require.Contains(t, responseErr.Detail.Message, "exceeds the context window")
 }
 
 func TestNormalizeWebSocketEventFlattensNestedError(t *testing.T) {

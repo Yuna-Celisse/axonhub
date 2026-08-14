@@ -275,6 +275,7 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 
 	channelSwitches := 0
 	sameChannelRetries := 0
+	invalidEncryptedContentRecoveryAttempted := false
 
 	// Step 3: Process the request
 	for {
@@ -293,6 +294,23 @@ func (p *pipeline) Process(ctx context.Context, request *httpclient.Request) (*R
 		// Stop retrying if the context is canceled or the deadline is exceeded.
 		if ctx.Err() != nil {
 			return nil, lastErr
+		}
+
+		// Encrypted reasoning content is scoped to the upstream account/model that
+		// produced it. Automatic model routing can therefore bring an otherwise
+		// OpenAI-shaped signature back to a different OpenAI account or model, where
+		// provider-only signature detection cannot identify the mismatch. If the
+		// upstream explicitly rejects the encrypted content, discard the stale
+		// signatures and retry the same request once. Valid signatures keep the fast
+		// path, and unrelated errors continue through the normal retry policy.
+		if !invalidEncryptedContentRecoveryAttempted &&
+			isInvalidEncryptedContentError(lastErr) &&
+			clearReasoningSignatures(llmRequest) {
+			invalidEncryptedContentRecoveryAttempted = true
+
+			slog.WarnContext(ctx, "retrying without invalid encrypted reasoning content")
+
+			continue
 		}
 
 		// Determine retry strategy

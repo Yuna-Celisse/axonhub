@@ -208,6 +208,7 @@ func convertAssistantMessage(msg llm.Message) []Item {
 			Signature: *msg.ReasoningSignature,
 		}}
 	}
+	var portableReasoningSummary *string
 
 	for _, reasoningItem := range reasoningItems {
 		encryptedContent := shared.DecodeOpenAIEncryptedContent(&reasoningItem.Signature)
@@ -229,6 +230,8 @@ func convertAssistantMessage(msg llm.Message) []Item {
 			EncryptedContent: encryptedContent,
 			Summary:          summary,
 		})
+	} else {
+		portableReasoningSummary = shared.FormatPortableReasoningSummary(msg.ReasoningContent)
 	}
 
 	// Handle tool calls
@@ -252,6 +255,12 @@ func convertAssistantMessage(msg llm.Message) []Item {
 	}
 
 	var contentItems []Item
+	if portableReasoningSummary != nil {
+		contentItems = append(contentItems, Item{
+			Type: "output_text",
+			Text: portableReasoningSummary,
+		})
+	}
 
 	flushMessage := func() {
 		if len(contentItems) == 0 {

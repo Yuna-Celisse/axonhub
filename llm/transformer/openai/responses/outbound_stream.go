@@ -702,11 +702,14 @@ func (s *responsesOutboundStream) transformStreamChunk(event *httpclient.StreamE
 		}
 
 	case StreamEventTypeError:
+		statusCode := responseErrorStatusCode(streamEvent.Code)
 		return &llm.ResponseError{
+			StatusCode: statusCode,
 			Detail: llm.ErrorDetail{
 				Code:    streamEvent.Code,
 				Message: streamEvent.Message,
 				Param:   lo.FromPtr(streamEvent.Param),
+				Type:    responseErrorType(statusCode),
 			},
 		}
 

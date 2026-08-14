@@ -4,6 +4,7 @@ import (
 	"github.com/samber/lo"
 
 	"github.com/looplj/axonhub/llm"
+	"github.com/looplj/axonhub/llm/transformer/shared"
 )
 
 // RequestFromLLM creates OpenAI Request from unified llm.Request with reasoning field configuration.
@@ -120,6 +121,7 @@ func MessageFromLLM(m llm.Message) Message {
 // MessageFromLLMWithConfig creates OpenAI Message from unified llm.Message with reasoning field configuration.
 func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Message {
 	var reasoningContent, reasoning *string
+	var portableReasoningSummary *string
 
 	// Apply reasoning field configuration
 	switch reasoningField {
@@ -143,6 +145,23 @@ func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Mess
 		// Strip all reasoning fields
 		reasoningContent = nil
 		reasoning = nil
+	case ReasoningFieldPortable:
+		if m.ReasoningSignature != nil && *m.ReasoningSignature != "" {
+			content := m.ReasoningContent
+			if content == nil {
+				content = m.Reasoning
+			}
+			portableReasoningSummary = shared.FormatPortableReasoningSummary(content)
+			reasoningContent = nil
+			reasoning = nil
+		} else {
+			// Unsigned reasoning is native to OpenAI-compatible chat APIs and can
+			// continue through their standard reasoning_content field.
+			reasoningContent = m.ReasoningContent
+			if reasoningContent == nil {
+				reasoningContent = m.Reasoning
+			}
+		}
 	default: // ReasoningFieldAll
 		// Preserve both reasoning fields with sync logic
 		reasoningContent = m.ReasoningContent
@@ -176,8 +195,10 @@ func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Mess
 		}
 	}
 
-	// Convert Content
-	msg.Content = MessageContentFromLLM(m.Content)
+	// Convert Content. A private signature is never serialized into OpenAI Chat.
+	// Its available summary is carried as ordinary text so a gateway-routed model
+	// can inherit the useful context without needing to decrypt the original blob.
+	msg.Content = MessageContentFromLLM(prependPortableReasoning(m.Content, portableReasoningSummary))
 
 	// Convert ToolCalls
 	if m.ToolCalls != nil {
@@ -204,6 +225,28 @@ func MessageFromLLMWithConfig(m llm.Message, reasoningField ReasoningField) Mess
 	}
 
 	return msg
+}
+
+func prependPortableReasoning(content llm.MessageContent, summary *string) llm.MessageContent {
+	if summary == nil {
+		return content
+	}
+
+	if len(content.MultipleContent) > 0 {
+		parts := make([]llm.MessageContentPart, 0, len(content.MultipleContent)+1)
+		parts = append(parts, llm.MessageContentPart{Type: "text", Text: summary})
+		parts = append(parts, content.MultipleContent...)
+
+		return llm.MessageContent{MultipleContent: parts}
+	}
+
+	if content.Content == nil || *content.Content == "" {
+		return llm.MessageContent{Content: summary}
+	}
+
+	combined := *summary + "\n\n" + *content.Content
+
+	return llm.MessageContent{Content: &combined}
 }
 
 // AnnotationFromLLM creates OpenAI Annotation from unified llm.Annotation.

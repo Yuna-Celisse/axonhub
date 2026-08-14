@@ -93,20 +93,25 @@ func shouldDecodeAnthropicSignature(config *Config) bool {
 	}
 }
 
-func prepareAnthropicReasoning(reasoningContent, reasoningSignature *string, config *Config) (*string, *string) {
+func prepareAnthropicReasoning(reasoningContent, reasoningSignature *string, config *Config) (*string, *string, *string) {
 	if reasoningSignature == nil || *reasoningSignature == "" {
-		return reasoningContent, reasoningSignature
+		return reasoningContent, reasoningSignature, nil
 	}
 
 	if shouldDecodeAnthropicSignature(config) {
 		if decoded := shared.DecodeAnthropicSignature(reasoningSignature); decoded != nil {
-			return reasoningContent, decoded
+			return reasoningContent, decoded, nil
 		}
 
-		return nil, nil
+		return nil, nil, shared.FormatPortableReasoningSummary(reasoningContent)
 	}
 
-	return reasoningContent, reasoningSignature
+	provider := shared.GuessSignatureProvider(*reasoningSignature).Provider
+	if provider == shared.ProviderOpenAI || provider == shared.ProviderGemini {
+		return nil, nil, shared.FormatPortableReasoningSummary(reasoningContent)
+	}
+
+	return reasoningContent, reasoningSignature, nil
 }
 
 // buildBaseRequest creates the base MessageRequest with common fields.
@@ -561,9 +566,7 @@ func convertAssistantWithToolCalls(msg llm.Message, config *Config) ([]MessagePa
 
 // buildPreBlocks creates thinking and text blocks that precede tool use.
 func buildPreBlocks(msg llm.Message, config *Config) []MessageContentBlock {
-	var blocks []MessageContentBlock
-
-	blocks = append(blocks, buildThinkingBlocks(msg, config)...)
+	blocks := buildThinkingBlocks(msg, config)
 
 	if block := buildRedactedThinkingBlock(msg.RedactedReasoningContent); block != nil {
 		blocks = append(blocks, *block)
@@ -670,10 +673,24 @@ func buildThinkingBlocks(msg llm.Message, config *Config) []MessageContentBlock 
 			reasoningSignature = lo.ToPtr(reasoningItem.Signature)
 		}
 
-		reasoningContent, reasoningSignature = prepareAnthropicReasoning(reasoningContent, reasoningSignature, config)
-		if block := buildThinkingBlock(reasoningContent, reasoningSignature); block != nil {
-			blocks = append(blocks, *block)
-		}
+		blocks = append(blocks, buildReasoningBlocks(reasoningContent, reasoningSignature, config)...)
+	}
+
+	return blocks
+}
+
+func buildReasoningBlocks(reasoningContent, reasoningSignature *string, config *Config) []MessageContentBlock {
+	content, signature, portableSummary := prepareAnthropicReasoning(reasoningContent, reasoningSignature, config)
+
+	blocks := make([]MessageContentBlock, 0, 1)
+	if block := buildThinkingBlock(content, signature); block != nil {
+		blocks = append(blocks, *block)
+	}
+	if portableSummary != nil {
+		blocks = append(blocks, MessageContentBlock{
+			Type: "text",
+			Text: portableSummary,
+		})
 	}
 
 	return blocks

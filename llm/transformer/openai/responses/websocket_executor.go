@@ -19,6 +19,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"github.com/looplj/axonhub/llm"
 	"github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/pipeline"
 	"github.com/looplj/axonhub/llm/streams"
@@ -140,24 +141,127 @@ func TopLevelWebSocketError(chunks []*httpclient.StreamEvent) error {
 			continue
 		}
 
-		var event StreamEvent
-		if err := json.Unmarshal(chunk.Data, &event); err != nil {
-			return fmt.Errorf("websocket error event")
-		}
-		if event.Code != "" && event.Message != "" {
-			return fmt.Errorf("websocket error event: %s: %s", event.Code, event.Message)
-		}
-		if event.Message != "" {
-			return fmt.Errorf("websocket error event: %s", event.Message)
-		}
-		if event.Code != "" {
-			return fmt.Errorf("websocket error event: %s", event.Code)
-		}
-
-		return fmt.Errorf("websocket error event")
+		return webSocketErrorEvent(chunk.Data)
 	}
 
 	return nil
+}
+
+func webSocketErrorEvent(data []byte) error {
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return fmt.Errorf("websocket error event: invalid JSON payload")
+	}
+
+	code := errorStringField(payload, "code")
+	message := errorStringField(payload, "message", "detail", "reason")
+
+	if nested, ok := payload["error"].(map[string]any); ok {
+		if code == "" {
+			code = errorStringField(nested, "code", "type")
+		}
+		if message == "" {
+			message = errorStringField(nested, "message", "detail", "reason")
+		}
+	} else if message == "" {
+		message, _ = payload["error"].(string)
+	}
+
+	if code != "" && message != "" {
+		if statusCode := responseErrorStatusCode(code); statusCode != 0 {
+			return &webSocketResponseError{
+				code:    code,
+				message: message,
+				responseErr: &llm.ResponseError{
+					StatusCode: statusCode,
+					Detail: llm.ErrorDetail{
+						Code:    code,
+						Message: message,
+						Type:    responseErrorType(statusCode),
+					},
+				},
+			}
+		}
+		return fmt.Errorf("websocket error event: %s: %s", code, message)
+	}
+	if message != "" {
+		return fmt.Errorf("websocket error event: %s", message)
+	}
+	if code != "" {
+		return fmt.Errorf("websocket error event: %s", code)
+	}
+
+	return fmt.Errorf("websocket error event: upstream returned an unrecognized error payload")
+}
+
+type webSocketResponseError struct {
+	code        string
+	message     string
+	responseErr *llm.ResponseError
+}
+
+func (e *webSocketResponseError) Error() string {
+	return fmt.Sprintf("websocket error event: %s: %s", e.code, e.message)
+}
+
+func (e *webSocketResponseError) Unwrap() error {
+	return e.responseErr
+}
+
+func responseErrorStatusCode(code string) int {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "context_length_exceeded", "invalid_request", "invalid_request_error", "bad_request":
+		return http.StatusBadRequest
+	case "authentication_error", "invalid_api_key", "unauthorized":
+		return http.StatusUnauthorized
+	case "permission_denied", "forbidden":
+		return http.StatusForbidden
+	case "not_found", "model_not_found":
+		return http.StatusNotFound
+	case "rate_limit_error", "rate_limit_exceeded":
+		return http.StatusTooManyRequests
+	case "server_error", "internal_error", "internal_server_error":
+		return http.StatusBadGateway
+	default:
+		return 0
+	}
+}
+
+func responseErrorType(statusCode int) string {
+	switch statusCode {
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusNotFound:
+		return "not_found_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	default:
+		return "api_error"
+	}
+}
+
+func errorStringField(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		value, ok := payload[key]
+		if !ok {
+			continue
+		}
+		switch value := value.(type) {
+		case string:
+			if value = strings.TrimSpace(value); value != "" {
+				return value
+			}
+		case json.Number:
+			return value.String()
+		case float64:
+			return fmt.Sprintf("%g", value)
+		}
+	}
+	return ""
 }
 
 func (e *WebSocketExecutor) DoStream(ctx context.Context, request *httpclient.Request) (streams.Stream[*httpclient.StreamEvent], error) {
@@ -210,6 +314,17 @@ func (e *WebSocketExecutor) DoStream(ctx context.Context, request *httpclient.Re
 		case <-stream.done:
 		}
 	}()
+
+	if e.inner != nil {
+		return &webSocketHTTPFallbackStream{
+			ctx:            ctx,
+			request:        request,
+			executor:       e.inner,
+			active:         stream,
+			primary:        stream,
+			usingWebSocket: true,
+		}, nil
+	}
 
 	return stream, nil
 }
@@ -1038,6 +1153,111 @@ type webSocketStream struct {
 	terminal bool
 }
 
+// webSocketHTTPFallbackStream retries through the executor's HTTP transport
+// when a WebSocket fails before yielding any usable response event. Once an
+// event has reached the caller, switching transports would duplicate a partial
+// response, so later failures are returned unchanged.
+type webSocketHTTPFallbackStream struct {
+	ctx      context.Context
+	request  *httpclient.Request
+	executor pipeline.Executor
+	active   streams.Stream[*httpclient.StreamEvent]
+	primary  streams.Stream[*httpclient.StreamEvent]
+
+	current           *httpclient.StreamEvent
+	err               error
+	emitted           bool
+	fallbackAttempted bool
+	usingWebSocket    bool
+	closed            bool
+}
+
+func (s *webSocketHTTPFallbackStream) Next() bool {
+	if s == nil || s.closed || s.err != nil {
+		return false
+	}
+
+	for s.active != nil {
+		if s.active.Next() {
+			event := s.active.Current()
+			if s.usingWebSocket && !s.emitted && event != nil && event.Type == string(StreamEventTypeError) {
+				if !s.startHTTPFallback(webSocketErrorEvent(event.Data)) {
+					return false
+				}
+				continue
+			}
+
+			s.current = event
+			s.emitted = true
+			return true
+		}
+
+		streamErr := s.active.Err()
+		if s.usingWebSocket && !s.emitted && !s.fallbackAttempted && shouldFallbackFromWebSocket(s.ctx, streamErr) {
+			if streamErr == nil {
+				streamErr = fmt.Errorf("websocket ended before response event")
+			}
+			if !s.startHTTPFallback(streamErr) {
+				return false
+			}
+			continue
+		}
+
+		s.err = streamErr
+		return false
+	}
+
+	return false
+}
+
+func (s *webSocketHTTPFallbackStream) startHTTPFallback(webSocketErr error) bool {
+	s.fallbackAttempted = true
+	s.usingWebSocket = false
+	if s.primary != nil {
+		_ = s.primary.Close()
+	}
+
+	fallback, err := s.executor.DoStream(s.ctx, s.request)
+	if err != nil {
+		s.err = fmt.Errorf("%v; HTTP fallback failed: %w", webSocketErr, err)
+		return false
+	}
+	s.active = fallback
+	return true
+}
+
+func shouldFallbackFromWebSocket(ctx context.Context, err error) bool {
+	if ctx != nil && ctx.Err() != nil {
+		return false
+	}
+	return !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+}
+
+func (s *webSocketHTTPFallbackStream) Current() *httpclient.StreamEvent {
+	if s == nil {
+		return nil
+	}
+	return s.current
+}
+
+func (s *webSocketHTTPFallbackStream) Err() error {
+	if s == nil {
+		return nil
+	}
+	return s.err
+}
+
+func (s *webSocketHTTPFallbackStream) Close() error {
+	if s == nil || s.closed {
+		return nil
+	}
+	s.closed = true
+	if s.active != nil {
+		return s.active.Close()
+	}
+	return nil
+}
+
 func (s *webSocketStream) Next() bool {
 	if s.contextCancelled() {
 		return false
@@ -1048,16 +1268,13 @@ func (s *webSocketStream) Next() bool {
 
 	_, msg, err := s.lease.conn.ReadMessage()
 	if err != nil {
-		if websocket.IsCloseError(err, websocket.CloseNormalClosure) || strings.Contains(err.Error(), "use of closed network connection") {
-			if ctxErr := s.ctx.Err(); ctxErr != nil {
-				s.setErr(ctxErr)
-			} else if !s.hasSeenEvent() {
-				s.setErr(fmt.Errorf("websocket closed before response event"))
-			}
-			s.finish(true)
-			return false
+		if ctxErr := s.ctx.Err(); ctxErr != nil {
+			s.setErr(ctxErr)
+		} else if !s.hasSeenEvent() {
+			s.setErr(fmt.Errorf("websocket closed before response event: %w", err))
+		} else if !websocket.IsCloseError(err, websocket.CloseNormalClosure) && !strings.Contains(err.Error(), "use of closed network connection") {
+			s.setErr(err)
 		}
-		s.setErr(err)
 		s.finish(true)
 		return false
 	}

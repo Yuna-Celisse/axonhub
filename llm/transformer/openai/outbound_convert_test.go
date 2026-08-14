@@ -533,6 +533,40 @@ func TestRequestFromLLM_KeepsGoogleThoughtSignatureInRequestModel(t *testing.T) 
 	require.Equal(t, "sig_from_metadata", req.Messages[0].ToolCalls[0].ExtraContent.Google.ThoughtSignature)
 }
 
+func TestMessageFromLLM_PortableReasoningForOpenCodeGo(t *testing.T) {
+	t.Run("signed GPT reasoning becomes ordinary context", func(t *testing.T) {
+		msg := MessageFromLLMWithConfig(llm.Message{
+			Role:               "assistant",
+			ReasoningContent:   lo.ToPtr("Inspected the repository and selected the next safe step."),
+			ReasoningSignature: lo.ToPtr("gAAAA-private-gpt-signature"),
+			Content: llm.MessageContent{
+				Content: lo.ToPtr("I will continue with the implementation."),
+			},
+		}, ReasoningFieldPortable)
+
+		require.Nil(t, msg.ReasoningContent)
+		require.Nil(t, msg.Reasoning)
+		require.Equal(t,
+			shared.PortableReasoningSummaryPrefix+"Inspected the repository and selected the next safe step.\n\nI will continue with the implementation.",
+			lo.FromPtr(msg.Content.Content),
+		)
+	})
+
+	t.Run("unsigned GLM or Kimi reasoning stays native", func(t *testing.T) {
+		msg := MessageFromLLMWithConfig(llm.Message{
+			Role:             "assistant",
+			ReasoningContent: lo.ToPtr("Unsigned OpenCode Go reasoning."),
+			Content: llm.MessageContent{
+				Content: lo.ToPtr("Visible answer."),
+			},
+		}, ReasoningFieldPortable)
+
+		require.Equal(t, "Unsigned OpenCode Go reasoning.", lo.FromPtr(msg.ReasoningContent))
+		require.Nil(t, msg.Reasoning)
+		require.Equal(t, "Visible answer.", lo.FromPtr(msg.Content.Content))
+	})
+}
+
 func TestMessageFromLLM_DoesNotOverrideFirstToolCallWhenMetadataExists(t *testing.T) {
 	msg := MessageFromLLM(llm.Message{
 		Role:               "assistant",

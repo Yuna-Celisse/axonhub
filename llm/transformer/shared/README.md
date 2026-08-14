@@ -68,12 +68,27 @@ everything else (including `unknown`) is dropped.
    forwards the signature if `GuessSignatureProvider` identifies it as belonging
    to the target provider; otherwise the signature is **dropped** (do not
    forward private protocol fields across providers).
+5. If the message also contains a provider-supplied reasoning summary, the
+   outbound transformer converts that summary into labeled, ordinary message
+   context. This portable fallback lets the next provider inherit the previous
+   model's plan and conclusions even though it cannot decrypt the private blob.
+6. If an OpenAI-compatible upstream identifies a same-provider blob as invalid
+   (for example, because it belongs to another account or model), the pipeline
+   removes stale signatures and retries once. The portable reasoning summary is
+   retained on that retry.
 
 Practical invariants:
 
 - **Strict filtering**: all three `Decode...` helpers (OpenAI, Anthropic, Gemini) only keep signatures positively identified as their own provider. `unknown` signatures are filtered to prevent `invalid_request_body` errors from downstream models.
 - **At provider edges**: a transformer decodes **only when required by that provider API**, and only when the heuristic matches that provider (otherwise drop on mismatch).
-- **Anthropic-specific exception**: decode is only required for Anthropic official platforms (`direct`, `claudecode`, `vertex`, `bedrock`). For other Anthropic-compatible outbound platforms, AxonHub forwards the value unchanged.
+- **Portable continuity**: dropping an incompatible signature does not drop its
+  available reasoning summary; the summary is labeled as coming from a previous
+  model and carried in normal message context.
+- **Anthropic-compatible exception**: strict Anthropic decoding is required for
+  official platforms (`direct`, `claudecode`, `vertex`, `bedrock`). Other
+  Anthropic-compatible platforms keep native or unknown signatures for
+  compatibility, but known OpenAI/Gemini signatures are filtered and handed off
+  through their portable summaries.
 
 ### Mermaid: end-to-end encode/decode flow
 

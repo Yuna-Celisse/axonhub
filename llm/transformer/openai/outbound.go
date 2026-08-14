@@ -37,6 +37,11 @@ const (
 	ReasoningFieldReasoning ReasoningField = "reasoning"
 	// ReasoningFieldNone strips all reasoning fields (Fireworks, bailian, etc).
 	ReasoningFieldNone ReasoningField = "none"
+	// ReasoningFieldPortable converts reasoning with a provider-private signature
+	// into ordinary message context, while preserving unsigned native reasoning.
+	// This is intended for multi-model gateways such as OpenCode Go, where the
+	// target cannot verify a signature issued by the previous provider.
+	ReasoningFieldPortable ReasoningField = "portable"
 	// ReasoningFieldAll preserves both reasoning and reasoning_content fields (default).
 	ReasoningFieldAll ReasoningField = "all"
 )

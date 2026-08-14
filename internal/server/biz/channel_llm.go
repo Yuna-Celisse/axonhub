@@ -1026,10 +1026,15 @@ func (svc *ChannelService) buildChannelWithTransformer(c *ent.Channel, apiKeyOve
 		if c.Settings != nil {
 			reasoningEffortMapping = c.Settings.TransformOptions.ReasoningEffortMapping
 		}
+		reasoningField := openai.ReasoningField("")
+		if c.Type == channel.TypeOpencodeGo {
+			reasoningField = openai.ReasoningFieldPortable
+		}
 		transformer, err := openai.NewOutboundTransformerWithConfig(&openai.Config{
 			PlatformType:           openai.PlatformOpenAI,
 			BaseURL:                c.BaseURL,
 			APIKeyProvider:         getAPIKeyProvider(ch),
+			ReasoningField:         reasoningField,
 			ReasoningEffortMapping: reasoningEffortMapping,
 		})
 		if err != nil {
